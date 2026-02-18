@@ -348,7 +348,7 @@ Events have a cooldown (1.5s per type) to prevent spam.
 ### Installation
 
 ```bash
-cd evolution-sim
+cd EvolutionEngine
 pip install -r requirements.txt
 ```
 
@@ -367,7 +367,7 @@ The Python backend handles ML computations (GA, clustering, statistics). If you 
 ## Project Structure
 
 ```
-evolution-sim/
+evolutionEngine/
 ├── server.py          # FastAPI backend — GA, k-means, stats (NumPy + scikit-learn)
 ├── index.html         # Frontend UI — canvas, controls, dashboard, analytics panel
 ├── sim.js             # Main simulation loop — orchestrates all modules
