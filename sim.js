@@ -169,6 +169,16 @@
   const BUDDING_CHANCE = 0.006;          // per tick per eligible bacterium (was 0.003)
   const MAX_POPULATION = 600;            // hard cap
 
+  // ── In-vivo evolution config ────────────────────────────────
+  // Spontaneous mutation: Poisson process, rate = lambda per tick
+  // P(mutation in t ticks) = 1 - e^(-lambda * t)
+  const EVOLVE_CHANCE = 0.0002;     // per tick per bacterium (~1.2%/sec)
+  const DNA_REPAIR_REDUCTION = 0.3; // DNA Repair trait reduces chance to 30%
+
+  // Horizontal Gene Transfer (HGT): proximity-based stochastic transfer
+  const HGT_RANGE = 30;             // pixels — bacteria must be this close
+  const HGT_CHANCE = 0.001;         // per tick per eligible donor-recipient pair
+
   // ── Utilities ──────────────────────────────────────────────
   const rand  = (min, max) => Math.random() * (max - min) + min;
   const randInt = (min, max) => Math.floor(rand(min, max + 1));
@@ -256,6 +266,15 @@
       deathTime: 0,
       deathCause: "",
     };
+  }
+
+  // ── Refresh traits after genome edit (evolution / HGT) ──
+  function refreshTraits(b) {
+    b.traits = Genetics.expressTraits(b.genome, TRAIT_POOL);
+    const dominantTrait = b.traits.length > 0 ? b.traits[0] : TRAIT_POOL[0];
+    b.color = dominantTrait.color;
+    b.size = 3 + b.traits.length * 0.4 + rand(-0.3, 0.8);
+    b.isPredator = b.traits.some(t => t.name === "Predatory Behavior");
   }
 
   // ── Population init ───────────────────────────────────────
@@ -383,7 +402,7 @@
     // Announcement
     selTraitName.textContent = `"${selectedTrait.name}"`;
     selTraitName.style.color = selectedTrait.color;
-    selTraitDesc.textContent = `Only bacteria with this trait survive!`;
+    selTraitDesc.textContent = `Bacteria with this trait are favoured!`;
     selAnnounce.classList.remove("visible");
     void selAnnounce.offsetWidth;
     selAnnounce.classList.add("visible");
@@ -394,18 +413,48 @@
     void flashOverlay.offsetWidth;
     flashOverlay.classList.add("active");
 
-    // Kill bacteria without the trait
+    // ── Probabilistic selection (realistic) ──
+    // Instead of binary kill, survival chance = gene value.
+    //   gene = 0.9 -> 90% survive   (strong expression)
+    //   gene = 0.5 -> 50% survive   (borderline)
+    //   gene = 0.1 -> 10% survive   (weak but not zero)
+    // This mirrors real selection: even low-fitness organisms
+    // occasionally survive, preserving genetic diversity.
+    //
+    // Minimum survivor floor: at least 15% or 10 bacteria
+    // survive regardless — total extinction is extremely rare
+    // in real microbiology.
+    const MIN_SURVIVORS = Math.max(10, Math.floor(alive.length * 0.15));
     let died = 0;
+    const deathCandidates = []; // { bacterium, survivalProb }
+
     alive.forEach(b => {
-      const hasTrait = b.genome[traitIndex] > 0.5;
-      if (!hasTrait) {
-        b.alive = false;
-        b.deathTime = performance.now();
-        b.deathCause = "selection";
-        deadBacteria.push(b);
-        died++;
+      const geneVal = b.genome[traitIndex]; // 0.0 to 1.0
+      const survivalProb = geneVal;         // direct mapping
+      if (Math.random() < survivalProb) {
+        // Survived — this bacterium lives
+      } else {
+        deathCandidates.push(b);
       }
     });
+
+    // Enforce minimum survivor floor
+    const potentialSurvivors = alive.length - deathCandidates.length;
+    let toKill = deathCandidates;
+    if (potentialSurvivors < MIN_SURVIVORS && deathCandidates.length > 0) {
+      // Sort by gene value descending — spare the ones closest to having the trait
+      deathCandidates.sort((a, b) => b.genome[traitIndex] - a.genome[traitIndex]);
+      const mustSpare = MIN_SURVIVORS - potentialSurvivors;
+      toKill = deathCandidates.slice(mustSpare); // spare the top ones
+    }
+
+    for (const b of toKill) {
+      b.alive = false;
+      b.deathTime = performance.now();
+      b.deathCause = "selection";
+      deadBacteria.push(b);
+      died++;
+    }
 
     diedThisRound = died;
 
@@ -614,6 +663,59 @@
         parent.energy *= 0.6; // parent splits energy with child
         bacteria.push(offspring);
         addEvent("budding", "[BUD]", `#${parent.id} budded -> #${offspring.id}`, "#4ade80");
+      }
+    }
+
+    // ── Spontaneous evolution (de novo trait mutation) ──
+    // Modeled as Poisson process: each bacterium has a small per-tick
+    // chance of flipping an unexpressed gene above the 0.5 threshold.
+    // "DNA Repair" trait suppresses this (fixes mutations efficiently).
+    for (const b of bacteria) {
+      if (!b.alive) continue;
+      let chance = EVOLVE_CHANCE;
+      if (b.traits.some(t => t.name === "DNA Repair")) chance *= DNA_REPAIR_REDUCTION;
+      if (Math.random() < chance * dt) {
+        // Collect unexpressed trait genes (< 0.5)
+        const unexpressed = [];
+        for (let i = 0; i < Genetics.TRAIT_GENE_COUNT; i++) {
+          if (b.genome[i] <= 0.5) unexpressed.push(i);
+        }
+        if (unexpressed.length > 0) {
+          const idx = unexpressed[Math.floor(Math.random() * unexpressed.length)];
+          b.genome[idx] = 0.5 + Math.random() * 0.5; // express the new trait
+          const newTrait = TRAIT_POOL[idx];
+          refreshTraits(b);
+          addEvent("evolve", "[EVOLVE]", `#${b.id} gained ${newTrait.name}`, newTrait.color);
+        }
+      }
+    }
+
+    // ── Horizontal Gene Transfer (HGT) ──
+    // Bacteria with "Gene Transfer" trait can pass expressed genes
+    // to nearby bacteria through direct contact — a real biological
+    // mechanism (conjugation, transformation, transduction).
+    for (const donor of bacteria) {
+      if (!donor.alive) continue;
+      if (!donor.traits.some(t => t.name === "Gene Transfer")) continue;
+      for (const recipient of bacteria) {
+        if (recipient === donor || !recipient.alive) continue;
+        const dx = donor.x - recipient.x;
+        const dy = donor.y - recipient.y;
+        if (dx * dx + dy * dy > HGT_RANGE * HGT_RANGE) continue;
+        if (Math.random() >= HGT_CHANCE * dt) continue;
+        // Find a gene donor has but recipient doesn't
+        const transferable = [];
+        for (let i = 0; i < Genetics.TRAIT_GENE_COUNT; i++) {
+          if (donor.genome[i] > 0.5 && recipient.genome[i] <= 0.5) transferable.push(i);
+        }
+        if (transferable.length > 0) {
+          const idx = transferable[Math.floor(Math.random() * transferable.length)];
+          recipient.genome[idx] = 0.5 + Math.random() * 0.3;
+          const traitName = TRAIT_POOL[idx].name;
+          refreshTraits(recipient);
+          addEvent("hgt", "[HGT]", `#${donor.id} -> #${recipient.id}: ${traitName}`, "#fdba74");
+        }
+        break; // one transfer attempt per donor per tick
       }
     }
 
